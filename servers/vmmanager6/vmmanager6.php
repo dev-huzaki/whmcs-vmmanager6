@@ -742,6 +742,164 @@ function _vmmanager6_change_password(array $params)
     $admin->post("vm/v3/host/" . $vm_id . "/password", $host_change_params);
 }
 
+/**
+ * Apply a full firewall_rules set to a VM.
+ *
+ * VMmanager's firewall_rules field is PUT-style: the array sent fully
+ * replaces whatever was previously defined on the host. Callers are
+ * expected to read existing rules first and pass the merged list.
+ *
+ * @param mixed $admin ISPsystem\API instance authorised as admin
+ * @param int   $vm_id VMmanager host id
+ * @param array $rules full list of FirewallRules items
+ *
+ * @return void
+ */
+function _vmmanager6_apply_host_firewall_rules($admin, $vm_id, array $rules)
+{
+    $resp = $admin->post("vm/v3/host/" . $vm_id, [
+        'firewall_rules' => $rules,
+    ]);
+
+    if (empty($resp->{"task"})) {
+        return;
+    }
+
+    \ISPsystem\wait(
+        function () use ($admin, $resp) {
+            return $admin->get(
+                "vm/v3/task?where=(consul_id+EQ+'" . $resp->{"task"} . "')"
+            )->{"list"};
+        },
+        function ($task_list) {
+            if (sizeof($task_list) == 0) {
+                return false;
+            }
+            foreach ($task_list as $task) {
+                $status = $task->{"status"};
+                if ($status == "fail") {
+                    throw new \ISPsystem\LogicError("Firewall rules update failed");
+                }
+                if ($status != "complete") {
+                    return false;
+                }
+            }
+            return true;
+        },
+        5 * 60,
+        12
+    );
+}
+
+/**
+ * Is this rule a port-25 drop rule (any direction / any protocol)?
+ *
+ * @param object|array $rule single FirewallRules item from API
+ *
+ * @return bool
+ */
+function _vmmanager6_is_port25_rule($rule)
+{
+    $rule = (array) $rule;
+    $ps = isset($rule['portstart']) ? (int) $rule['portstart'] : 0;
+    $pe = isset($rule['portend'])   ? (int) $rule['portend']   : 0;
+    return $ps === 25 && $pe === 25;
+}
+
+/**
+ * Build the canonical SMTP/25 drop rules (in + out, tcp+udp).
+ *
+ * @return array
+ */
+function _vmmanager6_port25_drop_rules()
+{
+    return [
+        [
+            "action"    => "drop",
+            "direction" => "in",
+            "protocols" => ["tcp", "udp"],
+            "portstart" => 25,
+            "portend"   => 25,
+        ],
+        [
+            "action"    => "drop",
+            "direction" => "out",
+            "protocols" => ["tcp", "udp"],
+            "portstart" => 25,
+            "portend"   => 25,
+        ],
+    ];
+}
+
+/**
+ * Read firewall_rules currently set on a host and strip port-25 entries.
+ * Lets block/unblock handlers safely preserve unrelated rules.
+ *
+ * @param mixed $admin ISPsystem\API authorised as admin
+ * @param int   $vm_id VMmanager host id
+ *
+ * @return array sanitized list, cast to plain arrays
+ */
+function _vmmanager6_read_rules_without_port25($admin, $vm_id)
+{
+    $vm_info = vmmanager6_get_vm_info($admin, $vm_id);
+    $existing = isset($vm_info->{"firewall_rules"}) ? $vm_info->{"firewall_rules"} : [];
+
+    $kept = [];
+    foreach ($existing as $rule) {
+        if (!_vmmanager6_is_port25_rule($rule)) {
+            $kept[] = (array) $rule;
+        }
+    }
+    return $kept;
+}
+
+/**
+ * Admin action: add SMTP/25 drop rules to the VM (idempotent).
+ *
+ * @param array $params WHMCS server module params
+ *
+ * @return void
+ */
+function _vmmanager6_block_port25(array $params)
+{
+    $admin = vmmanager6_get_admin($params);
+    $vm_id = vmmanager6_get_external_id($params);
+
+    if (empty($vm_id)) {
+        throw new \ISPsystem\LogicError("VM is not linked to a VMmanager host");
+    }
+
+    $rules = array_merge(
+        _vmmanager6_read_rules_without_port25($admin, $vm_id),
+        _vmmanager6_port25_drop_rules()
+    );
+
+    _vmmanager6_apply_host_firewall_rules($admin, $vm_id, $rules);
+}
+
+/**
+ * Admin action: remove SMTP/25 drop rules from the VM.
+ * Preserves any other firewall rules defined on the host.
+ *
+ * @param array $params WHMCS server module params
+ *
+ * @return void
+ */
+function _vmmanager6_unblock_port25(array $params)
+{
+    $admin = vmmanager6_get_admin($params);
+    $vm_id = vmmanager6_get_external_id($params);
+
+    if (empty($vm_id)) {
+        throw new \ISPsystem\LogicError("VM is not linked to a VMmanager host");
+    }
+
+    $rules = _vmmanager6_read_rules_without_port25($admin, $vm_id);
+
+    _vmmanager6_apply_host_firewall_rules($admin, $vm_id, $rules);
+}
+
 function vmmanager6_get_sso_redirect_address($params, $email = null) // phpcs:ignore
 {
     vmmanager6_load_ispsystem_libs();
@@ -820,6 +978,24 @@ function vmmanager6_ChangePassword(array $params)
     }
     vmmanager6_load_ispsystem_libs();
     return \ISPsystem\safeCall("_vmmanager6_change_password", $params, __FUNCTION__);
+}
+
+function vmmanager6_BlockPort25(array $params) // phpcs:ignore
+{
+    if ($params['configoption14'] === 'on') {
+        return 'success';
+    }
+    vmmanager6_load_ispsystem_libs();
+    return \ISPsystem\safeCall("_vmmanager6_block_port25", $params, __FUNCTION__);
+}
+
+function vmmanager6_UnblockPort25(array $params) // phpcs:ignore
+{
+    if ($params['configoption14'] === 'on') {
+        return 'success';
+    }
+    vmmanager6_load_ispsystem_libs();
+    return \ISPsystem\safeCall("_vmmanager6_unblock_port25", $params, __FUNCTION__);
 }
 
 function vmmanager6_AdminSingleSignOn(array $params) // phpcs:ignore
@@ -976,6 +1152,8 @@ function vmmanager6_AdminCustomButtonArray() // phpcs:ignore
         "Reboot Server" => "Reboot",
         "Power off Server" => "PowerOff",
         "Power on Server" => "PowerOn",
+        "Block SMTP port 25" => "BlockPort25",
+        "Unblock SMTP port 25" => "UnblockPort25",
     ];
 }
 
