@@ -749,6 +749,10 @@ function _vmmanager6_change_password(array $params)
  * replaces whatever was previously defined on the host. Callers are
  * expected to read existing rules first and pass the merged list.
  *
+ * The field lives in HostResourceParams, so the correct endpoint is
+ * POST /vm/v3/host/{id}/resource (host_edit_resource). Posting it to
+ * the root /vm/v3/host/{id} is rejected with "Unexpected property".
+ *
  * @param mixed $admin ISPsystem\API instance authorised as admin
  * @param int   $vm_id VMmanager host id
  * @param array $rules full list of FirewallRules items
@@ -757,7 +761,7 @@ function _vmmanager6_change_password(array $params)
  */
 function _vmmanager6_apply_host_firewall_rules($admin, $vm_id, array $rules)
 {
-    $resp = $admin->post("vm/v3/host/" . $vm_id, [
+    $resp = $admin->post("vm/v3/host/" . $vm_id . "/resource", [
         'firewall_rules' => $rules,
     ]);
 
