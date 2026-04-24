@@ -407,6 +407,25 @@ function _vmmanager6_create_account(array $params)
         $vm_create_params['ipv6_prefix'] = (int)$params['configoptions']['ipv6_prefix'];
     }
 
+    // Anti-spam policy: block SMTP port 25 (TCP+UDP, both directions) for all new VMs.
+    // VMmanager only supports action=drop; see FirewallRules schema in /vm/v3 API.
+    $vm_create_params["firewall_rules"] = [
+        [
+            "action"    => "drop",
+            "direction" => "in",
+            "protocols" => ["tcp", "udp"],
+            "portstart" => 25,
+            "portend"   => 25,
+        ],
+        [
+            "action"    => "drop",
+            "direction" => "out",
+            "protocols" => ["tcp", "udp"],
+            "portstart" => 25,
+            "portend"   => 25,
+        ],
+    ];
+
     $wait_for_os_install = (bool)($params["configoption10"] != "on");
 
     $vm_create = $admin->post("vm/v3/host", $vm_create_params);
