@@ -407,24 +407,12 @@ function _vmmanager6_create_account(array $params)
         $vm_create_params['ipv6_prefix'] = (int)$params['configoptions']['ipv6_prefix'];
     }
 
-    // Anti-spam policy: block SMTP port 25 (TCP+UDP, both directions) for all new VMs.
+    // Anti-spam policy: block SMTP port 25 (TCP+UDP, both directions) for all new VMs,
+    // unless the customer paid for the "Port 25 activation" configurable option.
     // VMmanager only supports action=drop; see FirewallRules schema in /vm/v3 API.
-    $vm_create_params["firewall_rules"] = [
-        [
-            "action"    => "drop",
-            "direction" => "in",
-            "protocols" => ["tcp", "udp"],
-            "portstart" => 25,
-            "portend"   => 25,
-        ],
-        [
-            "action"    => "drop",
-            "direction" => "out",
-            "protocols" => ["tcp", "udp"],
-            "portstart" => 25,
-            "portend"   => 25,
-        ],
-    ];
+    if (!_vmmanager6_is_port25_open_via_option($params)) {
+        $vm_create_params["firewall_rules"] = _vmmanager6_port25_drop_rules();
+    }
 
     $wait_for_os_install = (bool)($params["configoption10"] != "on");
 
@@ -576,6 +564,13 @@ function _vmmanager6_change_package(array $params)
 {
     $admin = vmmanager6_get_admin($params);
     $vm_id = vmmanager6_get_external_id($params);
+
+    // Sync SMTP/25 firewall state with the "Port 25 activation"
+    // configurable option *before* the resource changes. This runs
+    // unconditionally so toggling the option alone (without any other
+    // upgrade) still propagates to the firewall.
+    _vmmanager6_reconcile_port25_state($params, $admin, $vm_id);
+
     $vm_info = vmmanager6_get_vm_info($admin, $vm_id);
     $vm_ipv6_info = $admin->get("vm/v3/host/{$vm_id}/ipv6");
 
@@ -856,6 +851,134 @@ function _vmmanager6_read_rules_without_port25($admin, $vm_id)
         }
     }
     return $kept;
+}
+
+/**
+ * Is the "Port 25 activation" configurable option enabled for this service?
+ *
+ * Accepts several reasonable spellings of the option key (the friendly
+ * name set in WHMCS, plus a few common system-name variants in case the
+ * operator later renames it with a `system_name|Friendly Name` pipe).
+ *
+ * Truthy values: any non-zero quantity, "1", "yes", "y", "on", "true",
+ * "enabled", "enable". Anything else (including missing key, "0", "no",
+ * "off", empty string) is treated as disabled — i.e. block port 25.
+ *
+ * @param array $params WHMCS server module params
+ *
+ * @return bool true => keep port 25 open; false => block it
+ */
+function _vmmanager6_is_port25_open_via_option(array $params)
+{
+    if (empty($params['configoptions']) || !is_array($params['configoptions'])) {
+        return false;
+    }
+
+    $candidates = [
+        'Port 25 activation',
+        'port25',
+        'port_25',
+        'port25_activation',
+        'smtp25',
+    ];
+
+    $value = null;
+    foreach ($candidates as $key) {
+        if (array_key_exists($key, $params['configoptions'])) {
+            $value = $params['configoptions'][$key];
+            break;
+        }
+    }
+
+    if ($value === null) {
+        foreach ($params['configoptions'] as $key => $v) {
+            if (stripos((string) $key, 'port 25') !== false
+                || stripos((string) $key, 'port25') !== false
+            ) {
+                $value = $v;
+                break;
+            }
+        }
+    }
+
+    if ($value === null) {
+        return false;
+    }
+
+    if (is_numeric($value)) {
+        return (int) $value > 0;
+    }
+
+    $normalized = strtolower(trim((string) $value));
+    if ($normalized === '') {
+        return false;
+    }
+    $truthy = ['1', 'yes', 'y', 'on', 'true', 'enabled', 'enable', 'open'];
+    if (in_array($normalized, $truthy, true)) {
+        return true;
+    }
+    $falsy = ['0', 'no', 'n', 'off', 'false', 'disabled', 'disable', 'closed', '-'];
+    if (in_array($normalized, $falsy, true)) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Reconcile a VM's SMTP/25 firewall state with the "Port 25 activation"
+ * configurable option, without touching unrelated rules. Only POSTs to
+ * the VMmanager API when the desired state actually differs from the
+ * current one (no-op if already in sync).
+ *
+ * Used from ChangePackage so customers can flip the option on/off in
+ * an upgrade and have the firewall follow.
+ *
+ * @param array $params WHMCS server module params
+ * @param mixed $admin  optional pre-built ISPsystem\API admin client
+ * @param int   $vm_id  optional pre-resolved VMmanager host id
+ *
+ * @return void
+ */
+function _vmmanager6_reconcile_port25_state(array $params, $admin = null, $vm_id = null)
+{
+    if ($admin === null) {
+        $admin = vmmanager6_get_admin($params);
+    }
+    if ($vm_id === null) {
+        $vm_id = vmmanager6_get_external_id($params);
+    }
+    if (empty($vm_id)) {
+        return;
+    }
+
+    $vm_info  = vmmanager6_get_vm_info($admin, $vm_id);
+    $existing = isset($vm_info->{"firewall_rules"}) ? $vm_info->{"firewall_rules"} : [];
+
+    $kept              = [];
+    $has_port25_drop   = false;
+    foreach ($existing as $rule) {
+        if (_vmmanager6_is_port25_rule($rule)) {
+            $has_port25_drop = true;
+            continue;
+        }
+        $kept[] = (array) $rule;
+    }
+
+    $want_open = _vmmanager6_is_port25_open_via_option($params);
+
+    if ($want_open && !$has_port25_drop) {
+        return;
+    }
+    if (!$want_open && $has_port25_drop) {
+        return;
+    }
+
+    $rules = $want_open
+        ? $kept
+        : array_merge($kept, _vmmanager6_port25_drop_rules());
+
+    _vmmanager6_apply_host_firewall_rules($admin, $vm_id, $rules);
 }
 
 /**
